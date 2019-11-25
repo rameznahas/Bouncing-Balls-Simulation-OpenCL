@@ -2,13 +2,13 @@
 #include <glew.h>
 #include <freeglut.h>
 #include <cl.h>
+#include <cl_gl.h>
 #include <string>
 #include <random>
 #include <math.h>
 #include <iostream>
 #include <fstream>
 #include <sstream>
-#include <direct.h>
 
 #define MAX_INFO_LENGTH 1024
 #define DEBUG_LOG_BUFFER_SIZE 16384
@@ -17,8 +17,8 @@
 #define UPDATE_FREQ 1.f / 30
 #define BALL_COUNT 10
 #define MIN_RADIUS 0.05f
-#define PI 3.141592f
-#define DEGREE_TO_RAD PI / 180
+//#define PI 3.141592f
+//#define DEGREE_TO_RAD PI / 180
 #define NUM_POINTS 360
 #define WORK_GROUP_SIZE 256
 
@@ -57,6 +57,8 @@ struct ball {
 	int mass;
 };
 
+GLuint vbo;
+
 ball* balls = nullptr;
 unsigned int* pairs = nullptr;
 size_t balls_count, pairs_count;
@@ -66,14 +68,18 @@ cl_context context = nullptr;
 cl_device_id device = nullptr;
 cl_command_queue cmd_q = nullptr;
 cl_program program = nullptr;
-cl_mem d_balls = nullptr, d_pairs = nullptr;
-cl_kernel wall_bounce = nullptr, ball_bounce = nullptr;
+cl_mem d_balls = nullptr, d_pairs = nullptr, d_vbo = nullptr;
+cl_kernel wall_bounce = nullptr, ball_bounce = nullptr, update_vbo = nullptr;
+cl_int status = CL_SUCCESS;
 
 clock_t previous_t = 0, current_t = 0;
 float delta_t = UPDATE_FREQ;
 
+// forward declaration
+void update();
+
 void create_context() {
-	cl_int status;
+	status = CL_SUCCESS;
 	cl_uint num_platforms;
 	cl_platform_id* platforms;
 
@@ -157,12 +163,57 @@ void create_context() {
 	cl_device_id device = devices[device_num - 1];
 	delete[] devices;
 
-	context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &status);
+	cl_context_properties properties[] = {
+		CL_GL_CONTEXT_KHR, (cl_context_properties)wglGetCurrentContext(),
+		CL_WGL_HDC_KHR, (cl_context_properties)wglGetCurrentDC(),
+		CL_CONTEXT_PLATFORM, (cl_context_properties)platform,
+		0
+	};
+
+	context = clCreateContext(properties, 1, &device, nullptr, nullptr, &status);
+}
+
+cl_int create_clgl_buffers() {
+	status = CL_SUCCESS;
+
+	glGenBuffers(1, &vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glBufferData(GL_ARRAY_BUFFER, balls_count * NUM_POINTS * 2 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+	d_vbo = clCreateFromGLBuffer(context, CL_MEM_READ_WRITE, vbo, &status);
+	if (status != CL_SUCCESS || d_vbo == nullptr) {
+		std::cout << "Failed to associate CL buffer to GL buffer." << std::endl;
+		return status;
+	}
+
+	d_balls = clCreateBuffer(context, CL_MEM_READ_WRITE, balls_size, nullptr, &status);
+	if (status != CL_SUCCESS || d_balls == nullptr) {
+		std::cout << "Failed to allocate a buffer on device." << std::endl;
+		return status;
+	}
+	status = clEnqueueWriteBuffer(cmd_q, d_balls, CL_TRUE, 0, balls_size, balls, 0, nullptr, nullptr);
+	if (status != CL_SUCCESS) {
+		std::cout << "Failed to write data to device memory." << std::endl;
+		return status;
+	}
+
+	d_pairs = clCreateBuffer(context, CL_MEM_READ_WRITE, pairs_size, nullptr, &status);
+	if (status != CL_SUCCESS || d_pairs == nullptr) {
+		std::cout << "Failed to allocate a buffer on device." << std::endl;
+		return status;
+	}
+
+	status = clEnqueueWriteBuffer(cmd_q, d_pairs, CL_TRUE, 0, pairs_size, pairs, 0, nullptr, nullptr);
+	if (status != CL_SUCCESS) {
+		std::cout << "Failed to write data to device memory." << std::endl;
+		return status;
+	}
+
+	return status;
 }
 
 void create_program(cl_uint num_devices, const char* file_name) {
-	cl_int status;
-
 	std::ifstream kernel(file_name, std::ifstream::in);
 	if (!kernel.is_open()) {
 		std::cout << "Failed to open kernel file." << std::endl;
@@ -193,13 +244,14 @@ void create_program(cl_uint num_devices, const char* file_name) {
 }
 
 cl_int create_kernels() {
-	cl_int status = CL_SUCCESS;
+	status = CL_SUCCESS;
 
 	wall_bounce = clCreateKernel(program, "wall_bounce", &status);
 	if (status != CL_SUCCESS) {
 		std::cout << "Failed to create kernel from program." << std::endl;
 		return status;
 	}
+
 	status = clSetKernelArg(wall_bounce, 0, sizeof(cl_mem), &d_balls);
 	status |= clSetKernelArg(wall_bounce, 1, sizeof(float), &delta_t);
 	status |= clSetKernelArg(wall_bounce, 2, sizeof(unsigned int), &balls_count);
@@ -213,6 +265,7 @@ cl_int create_kernels() {
 		std::cout << "Failed to create kernel from program." << std::endl;
 		return status;
 	}
+
 	status = clSetKernelArg(ball_bounce, 0, sizeof(cl_mem), &d_pairs);
 	status |= clSetKernelArg(ball_bounce, 1, sizeof(cl_mem), &d_balls);
 	status |= clSetKernelArg(ball_bounce, 2, sizeof(unsigned int), &pairs_count);
@@ -221,20 +274,35 @@ cl_int create_kernels() {
 		return status;
 	}
 
+	update_vbo = clCreateKernel(program, "update_vbo", &status);
+	if (status != CL_SUCCESS) {
+		std::cout << "Failed to create kernel from program." << std::endl;
+		return status;
+	}
+
+	status = clSetKernelArg(update_vbo, 0, sizeof(cl_mem), &d_balls);
+	status |= clSetKernelArg(update_vbo, 1, sizeof(cl_mem), &d_vbo);
+	status |= clSetKernelArg(update_vbo, 2, sizeof(unsigned int), &balls_count);
+	if (status != CL_SUCCESS) {
+		std::cout << "Failed to set kernel args." << std::endl;
+		return status;
+	}
+
 	return status;
 }
 
-cl_int init(int argc, char** argv) {
-	cl_int status = CL_SUCCESS;
-	
+void init(int argc, char** argv) {
 	//////////////////////////init display//////////////////////////
 	glutInit(&argc, argv);
 	glutInitWindowPosition(-1, -1);
 	glutInitWindowSize(WWIDTH, WHEIGHT);
 	glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE | GLUT_ALPHA);
 	glutCreateWindow("Bouncing Balls Simulation");
+	glewInit();
 	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 	glEnable(GL_BLEND);
+	glutDisplayFunc(update);
+	glutIdleFunc(update);
 	////////////////////////////////////////////////////////////////
 
 	///////////////////////////init balls///////////////////////////
@@ -262,17 +330,6 @@ cl_int init(int argc, char** argv) {
 	}
 
 	balls_size = balls_count * sizeof(ball);
-	d_balls = clCreateBuffer(context, CL_MEM_READ_WRITE, balls_size, nullptr, &status);
-	if (status != CL_SUCCESS || d_balls == nullptr) {
-		std::cout << "Failed to allocate a buffer on device." << std::endl;
-		return status;
-	}
-
-	status = clEnqueueWriteBuffer(cmd_q, d_balls, CL_TRUE, 0, balls_size, balls, 0, nullptr, nullptr);
-	if (status != CL_SUCCESS) {
-		std::cout << "Failed to write data to device memory." << std::endl;
-		return status;
-	}
 	////////////////////////////////////////////////////////////////
 
 	///////////////////////////init pairs///////////////////////////
@@ -293,44 +350,24 @@ cl_int init(int argc, char** argv) {
 	}
 
 	pairs_size = pairs_count * sizeof(unsigned int) * 2;
-	d_pairs = clCreateBuffer(context, CL_MEM_READ_WRITE, pairs_size, nullptr, &status);
-	if (status != CL_SUCCESS || d_pairs == nullptr) {
-		std::cout << "Failed to allocate a buffer on device." << std::endl;
-		return status;
-	}
-
-	status = clEnqueueWriteBuffer(cmd_q, d_pairs, CL_TRUE, 0, pairs_size, pairs, 0, nullptr, nullptr);
-	if (status != CL_SUCCESS) {
-		std::cout << "Failed to write data to device memory." << std::endl;
-		return status;
-	}
 	////////////////////////////////////////////////////////////////
-
-	return status;
 }
 
 void draw() {
 	glClearColor(0.25f, 0.25f, 0.25f, 1.f);
 	glClear(GL_COLOR_BUFFER_BIT);
 
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glEnableClientState(GL_VERTEX_ARRAY);
+	glVertexPointer(2, GL_FLOAT, 0, 0);
 	for (unsigned int i = 0; i < balls_count; ++i) {
 		ball& ball = balls[i];
-
-		glBegin(GL_POLYGON);
 		glColor4f(ball.color[0], ball.color[1], ball.color[2], 0.25f);
-
-		for (int j = 0; j < NUM_POINTS; ++j) {
-			float angle = j * DEGREE_TO_RAD;
-
-			glVertex2d
-			(
-				ball.radius * cos(angle) + ball.center[0],	// x-coord
-				ball.radius * sin(angle) + ball.center[1]	// y-coord
-			);
-		}
-
-		glEnd();
+		glDrawArrays(GL_POLYGON, i * NUM_POINTS * 2, NUM_POINTS * 2);
 	}
+	glDisableClientState(GL_VERTEX_ARRAY);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+
 	glutSwapBuffers();
 }
 
@@ -345,9 +382,13 @@ void update() {
 	// store last draw time
 	previous_t = current_t;
 
+	//glFinish();
 	clEnqueueNDRangeKernel(cmd_q, wall_bounce, 1, nullptr, &balls_count, &balls_count, 0, nullptr, nullptr);
 	clEnqueueNDRangeKernel(cmd_q, ball_bounce, 1, nullptr, &pairs_count, &pairs_count, 0, nullptr, nullptr);
-	clEnqueueReadBuffer(cmd_q, d_balls, CL_TRUE, 0, balls_size, balls, 0, nullptr, nullptr);
+	clEnqueueAcquireGLObjects(cmd_q, 1, &d_vbo, 0, nullptr, nullptr);
+	clEnqueueNDRangeKernel(cmd_q, update_vbo, 1, nullptr, &balls_count, &balls_count, 0, nullptr, nullptr);
+	clEnqueueReleaseGLObjects(cmd_q, 1, &d_balls, 0, nullptr, nullptr);
+	//clFinish(cmd_q);
 
 	draw();
 }
@@ -362,14 +403,16 @@ void cleanup() {
 	if (ball_bounce) clReleaseKernel(ball_bounce);
 	if (program) clReleaseProgram(program);
 	if (context) clReleaseContext(context);
+	// add opengl cleanup
 }
 
 int main(int argc, char** argv) {
-	cl_int status;
+	init(argc, argv);
 
 	create_context();
 	if (!context) {
 		std::cout << "Failed to create an OpenCL context." << std::endl;
+		cleanup();
 		std::exit(1);
 	}
 
@@ -387,14 +430,14 @@ int main(int argc, char** argv) {
 		std::exit(1);
 	}
 
-	create_program(1, "bouncing_balls.cl");
-	if (!program) {
+	status = create_clgl_buffers();
+	if (status != CL_SUCCESS) {
 		cleanup();
 		std::exit(1);
 	}
 
-	status = init(argc, argv);
-	if (status != CL_SUCCESS) {
+	create_program(1, "./src/bouncing_balls.cl");
+	if (!program) {
 		cleanup();
 		std::exit(1);
 	}
@@ -404,9 +447,7 @@ int main(int argc, char** argv) {
 		cleanup();
 		std::exit(1);
 	}
-
-	glutDisplayFunc(update);
-	glutIdleFunc(update);
+	
 	glutMainLoop();
 
 	cleanup();

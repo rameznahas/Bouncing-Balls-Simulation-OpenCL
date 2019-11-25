@@ -1,3 +1,7 @@
+#define NUM_POINTS 360
+#define PI 3.141592f
+#define DEGREE_TO_RAD PI / 180
+
 struct ball {
 	float color[3];
 	float center[2];
@@ -87,6 +91,22 @@ __kernel void ball_bounce(__global unsigned int* d_pairs, __global struct ball* 
 				other->velocity[0] += (current->mass * ratio * c_x);
 				other->velocity[1] += (current->mass * ratio * c_y);
 			}
+		}
+	}
+}
+
+__kernel void update_vbo(__global struct ball* d_balls, __global float* d_vbo, unsigned int balls_count) { 
+	int id = get_global_id(0);
+	if (id < balls_count) { 
+		__global struct ball* current = &d_balls[id];
+
+		int NUM_FLOATS = NUM_POINTS * 2;
+		int idx = id * NUM_FLOATS;
+
+		for (int j = 0; j < NUM_FLOATS; j += 2) {
+			float angle = j * DEGREE_TO_RAD;
+			d_vbo[idx++] = current->radius * cos(angle) + current->center[0]; // x-coord
+			d_vbo[idx++] = current->radius * sin(angle) + current->center[1]; // y-coord
 		}
 	}
 }
