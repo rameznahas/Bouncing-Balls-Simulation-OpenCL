@@ -181,7 +181,7 @@ cl_int create_clgl_buffers() {
 	glBufferData(GL_ARRAY_BUFFER, balls_count * NUM_POINTS * 2 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-	d_vbo = clCreateFromGLBuffer(context, CL_MEM_READ_WRITE, vbo, &status);
+	d_vbo = clCreateFromGLBuffer(context, CL_MEM_WRITE_ONLY, vbo, &status);
 	if (status != CL_SUCCESS || d_vbo == nullptr) {
 		std::cout << "Failed to associate CL buffer to GL buffer." << std::endl;
 		return status;
@@ -363,7 +363,7 @@ void draw() {
 	for (unsigned int i = 0; i < balls_count; ++i) {
 		ball& ball = balls[i];
 		glColor4f(ball.color[0], ball.color[1], ball.color[2], 0.25f);
-		glDrawArrays(GL_POLYGON, i * NUM_POINTS * 2, NUM_POINTS * 2);
+		glDrawArrays(GL_POLYGON, i * NUM_POINTS * 2, (NUM_POINTS * 2) - 1);
 	}
 	glDisableClientState(GL_VERTEX_ARRAY);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -382,13 +382,13 @@ void update() {
 	// store last draw time
 	previous_t = current_t;
 
-	//glFinish();
+	glFinish();
 	clEnqueueNDRangeKernel(cmd_q, wall_bounce, 1, nullptr, &balls_count, &balls_count, 0, nullptr, nullptr);
 	clEnqueueNDRangeKernel(cmd_q, ball_bounce, 1, nullptr, &pairs_count, &pairs_count, 0, nullptr, nullptr);
 	clEnqueueAcquireGLObjects(cmd_q, 1, &d_vbo, 0, nullptr, nullptr);
 	clEnqueueNDRangeKernel(cmd_q, update_vbo, 1, nullptr, &balls_count, &balls_count, 0, nullptr, nullptr);
 	clEnqueueReleaseGLObjects(cmd_q, 1, &d_balls, 0, nullptr, nullptr);
-	//clFinish(cmd_q);
+	clFinish(cmd_q);
 
 	draw();
 }
