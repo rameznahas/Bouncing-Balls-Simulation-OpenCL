@@ -486,7 +486,7 @@ int main(int argc, char** argv) {
 		std::exit(1);
 	}
 
-	create_program(1, "./src/bouncing_balls.cl");
+	create_program(1, "bouncing_balls.cl");
 	if (!program) {
 		cleanup();
 		std::exit(1);
