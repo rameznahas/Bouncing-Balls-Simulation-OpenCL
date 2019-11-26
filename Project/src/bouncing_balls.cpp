@@ -14,13 +14,9 @@
 #define DEBUG_LOG_BUFFER_SIZE 16384
 #define WWIDTH 800
 #define WHEIGHT 800
-#define UPDATE_FREQ 1.f / 30
 #define BALL_COUNT 10
 #define MIN_RADIUS 0.05f
-//#define PI 3.141592f
-//#define DEGREE_TO_RAD PI / 180
 #define NUM_POINTS 360
-#define WORK_GROUP_SIZE 256
 
 struct ball {
 	ball() = default;
@@ -57,13 +53,19 @@ struct ball {
 	int mass;
 };
 
-GLuint vbo;
+const float UPDATE_FREQ = 1.f / 30;
+const int NUM_FLOATS = NUM_POINTS * 2;
 
+//////////Host variables//////////
 ball* balls = nullptr;
 unsigned int* pairs = nullptr;
 size_t balls_count, pairs_count;
 size_t balls_size, pairs_size;
+clock_t previous_t = 0, current_t = 0;
+float delta_t = UPDATE_FREQ;
 
+/////////Device variables/////////
+GLuint vbo;
 cl_context context = nullptr;
 cl_device_id device = nullptr;
 cl_command_queue cmd_q = nullptr;
@@ -72,12 +74,15 @@ cl_mem d_balls = nullptr, d_pairs = nullptr, d_vbo = nullptr;
 cl_kernel wall_bounce = nullptr, ball_bounce = nullptr, update_vbo = nullptr;
 cl_int status = CL_SUCCESS;
 
-clock_t previous_t = 0, current_t = 0;
-float delta_t = UPDATE_FREQ;
-
 // forward declaration
 void update();
 
+/*
+	Creates an OpenCL context after discovering available platforms and devices.
+
+	Polls the users for their choice of platform and device. Once the choices have
+	been made, creates the context.
+*/
 void create_context() {
 	status = CL_SUCCESS;
 	cl_uint num_platforms;
@@ -95,6 +100,7 @@ void create_context() {
 
 	char info[MAX_INFO_LENGTH];
 
+	// print information of all platforms found.
 	for (unsigned int i = 0; i < num_platforms; ++i) {
 		std::cout << "Platform (" << (i + 1) << ")" << std::endl;
 
@@ -129,6 +135,7 @@ void create_context() {
 	devices = new cl_device_id[num_devices];
 	clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, num_devices, devices, nullptr);
 
+	// print information of all devices found for the selected platform.
 	for (unsigned int i = 0; i < num_devices; ++i) {
 		std::cout << "Device (" << (i + 1) << ")" << std::endl;
 		
@@ -163,6 +170,7 @@ void create_context() {
 	cl_device_id device = devices[device_num - 1];
 	delete[] devices;
 
+	// create the context properties required for OpenCL/OpenGL interoperability.
 	cl_context_properties properties[] = {
 		CL_GL_CONTEXT_KHR, (cl_context_properties)wglGetCurrentContext(),
 		CL_WGL_HDC_KHR, (cl_context_properties)wglGetCurrentDC(),
@@ -173,12 +181,18 @@ void create_context() {
 	context = clCreateContext(properties, 1, &device, nullptr, nullptr, &status);
 }
 
+/*
+	Creates all the necessary device buffers (both OpenCL and OpenGL buffers for interoperability).
+
+	For purely CL buffers (that don't operate with GL buffers), data is also copied from host
+	to device.
+*/
 cl_int create_clgl_buffers() {
 	status = CL_SUCCESS;
 
 	glGenBuffers(1, &vbo);
 	glBindBuffer(GL_ARRAY_BUFFER, vbo);
-	glBufferData(GL_ARRAY_BUFFER, balls_count * NUM_POINTS * 2 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+	glBufferData(GL_ARRAY_BUFFER, balls_count * NUM_FLOATS * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 
 	d_vbo = clCreateFromGLBuffer(context, CL_MEM_WRITE_ONLY, vbo, &status);
@@ -213,18 +227,23 @@ cl_int create_clgl_buffers() {
 	return status;
 }
 
+/*
+	Creates and builds an OpenCL program from file_name which contains the CL kernels.
+*/
 void create_program(cl_uint num_devices, const char* file_name) {
+	// attempt to open kernel file.
 	std::ifstream kernel(file_name, std::ifstream::in);
 	if (!kernel.is_open()) {
 		std::cout << "Failed to open kernel file." << std::endl;
 		return;
 	}
-
+	//////read file content into string//////
 	std::ostringstream buff;
 	buff << kernel.rdbuf();
 
 	std::string s = buff.str();
 	const char* kernels = s.c_str();
+	/////////////////////////////////////////
 
 	program = clCreateProgramWithSource(context, 1, (const char**)&kernels, nullptr, &status);
 	if (status != CL_SUCCESS) {
@@ -243,6 +262,11 @@ void create_program(cl_uint num_devices, const char* file_name) {
 	}
 }
 
+/*
+	Creates all the OpenCL kernels to be used in the OpenCL program.
+
+	Also sets the kernel arguments.
+*/
 cl_int create_kernels() {
 	status = CL_SUCCESS;
 
@@ -291,6 +315,9 @@ cl_int create_kernels() {
 	return status;
 }
 
+/*
+	Initializes the display, balls and unique ball pairs.
+*/
 void init(int argc, char** argv) {
 	//////////////////////////init display//////////////////////////
 	glutInit(&argc, argv);
@@ -353,6 +380,9 @@ void init(int argc, char** argv) {
 	////////////////////////////////////////////////////////////////
 }
 
+/*
+	Draws the balls.
+*/
 void draw() {
 	glClearColor(0.25f, 0.25f, 0.25f, 1.f);
 	glClear(GL_COLOR_BUFFER_BIT);
@@ -363,7 +393,7 @@ void draw() {
 	for (unsigned int i = 0; i < balls_count; ++i) {
 		ball& ball = balls[i];
 		glColor4f(ball.color[0], ball.color[1], ball.color[2], 0.25f);
-		glDrawArrays(GL_POLYGON, i * NUM_POINTS * 2, (NUM_POINTS * 2) - 1);
+		glDrawArrays(GL_POLYGON, i * NUM_POINTS, NUM_POINTS);
 	}
 	glDisableClientState(GL_VERTEX_ARRAY);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -371,6 +401,13 @@ void draw() {
 	glutSwapBuffers();
 }
 
+/*
+	Updates the frame 30 times per second.
+
+	Queues OpenCL kernel calls that will execute on the device to compute
+	ball-wall and ball-ball collisions. It then uses the new values to render
+	the new frame.
+*/
 void update() {
 	//update current clock time
 	current_t = clock();
@@ -382,28 +419,41 @@ void update() {
 	// store last draw time
 	previous_t = current_t;
 
-	glFinish();
+	// queue ball-wall collision computation
 	clEnqueueNDRangeKernel(cmd_q, wall_bounce, 1, nullptr, &balls_count, &balls_count, 0, nullptr, nullptr);
+	// queue ball-ball collision computation
 	clEnqueueNDRangeKernel(cmd_q, ball_bounce, 1, nullptr, &pairs_count, &pairs_count, 0, nullptr, nullptr);
+	
+	// wait for all OpenGL routines to finish before acquiring CL/GL shared data.
+	glFinish();
+	// acquire shared data.
 	clEnqueueAcquireGLObjects(cmd_q, 1, &d_vbo, 0, nullptr, nullptr);
+	// queue update_vbo kernel to update vbo values for OpenGL.
 	clEnqueueNDRangeKernel(cmd_q, update_vbo, 1, nullptr, &balls_count, &balls_count, 0, nullptr, nullptr);
-	clEnqueueReleaseGLObjects(cmd_q, 1, &d_balls, 0, nullptr, nullptr);
+	// release shared data.
+	clEnqueueReleaseGLObjects(cmd_q, 1, &d_vbo, 0, nullptr, nullptr);
+	// wait for all OpenCL routines to finish before letting OpenGL draw.
 	clFinish(cmd_q);
 
 	draw();
 }
 
+/*
+	Frees all the resources.
+*/
 void cleanup() {
 	if (balls) delete[] balls;
 	if (pairs) delete[] pairs;
+	if (vbo) glDeleteBuffers(1, &vbo);
 	if (d_balls) clReleaseMemObject(d_balls);
 	if (d_pairs) clReleaseMemObject(d_pairs);
+	if (d_vbo) clReleaseMemObject(d_vbo);
 	if (cmd_q) clReleaseCommandQueue(cmd_q);
 	if (wall_bounce) clReleaseKernel(wall_bounce);
 	if (ball_bounce) clReleaseKernel(ball_bounce);
+	if (update_vbo) clReleaseKernel(update_vbo);
 	if (program) clReleaseProgram(program);
 	if (context) clReleaseContext(context);
-	// add opengl cleanup
 }
 
 int main(int argc, char** argv) {

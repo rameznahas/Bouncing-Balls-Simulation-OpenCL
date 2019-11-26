@@ -1,6 +1,8 @@
 #define NUM_POINTS 360
 #define PI 3.141592f
-#define DEGREE_TO_RAD PI / 180
+
+constant float DEGREE_TO_RAD = PI / 180;
+constant int NUM_FLOATS = NUM_POINTS * 2;
 
 struct ball {
 	float color[3];
@@ -10,6 +12,9 @@ struct ball {
 	int mass;
 };
 
+/*
+	Handles the ball-wall computation.
+*/
 __kernel void wall_bounce(__global struct ball* d_balls, float delta_t, unsigned int balls_count) {
 	 int id = get_global_id(0);
 		if (id < balls_count) {
@@ -44,6 +49,9 @@ __kernel void wall_bounce(__global struct ball* d_balls, float delta_t, unsigned
 		}
 }
 
+/*
+	Handles the ball-ball computation.
+*/
 __kernel void ball_bounce(__global unsigned int* d_pairs, __global struct ball* d_balls, unsigned int pairs_count) {
 	unsigned int id = get_global_id(0);
 	if (id < pairs_count) {
@@ -95,15 +103,17 @@ __kernel void ball_bounce(__global unsigned int* d_pairs, __global struct ball* 
 	}
 }
 
+/*
+	Updates the vbo to be used by OpenGL to draw the new values computed earlier.
+*/
 __kernel void update_vbo(__global struct ball* d_balls, __global float* d_vbo, unsigned int balls_count) { 
 	int id = get_global_id(0);
 	if (id < balls_count) { 
 		__global struct ball* current = &d_balls[id];
 
-		int NUM_FLOATS = NUM_POINTS * 2;
 		int idx = id * NUM_FLOATS;
 
-		for (int j = 0; j < NUM_FLOATS; j += 2) {
+		for (int j = 0; j < NUM_POINTS; ++j) {
 			float angle = j * DEGREE_TO_RAD;
 			d_vbo[idx++] = current->radius * cos(angle) + current->center[0]; // x-coord
 			d_vbo[idx++] = current->radius * sin(angle) + current->center[1]; // y-coord
